@@ -9,7 +9,7 @@ from steve1.data.text_alignment.vae import load_vae_model
 from steve1.utils.mineclip_agent_env_utils import load_mineclip_agent_env
 from steve1.utils.text_overlay_utils import created_fitted_text_image
 from steve1.utils.video_utils import save_frames_as_video
-from steve1.utils.state import extract_inventory
+from steve1.utils.state import extract_inventory, check_mineclip_success
 
 from steve1.config import PRIOR_INFO, DEVICE
 from steve1.utils.embed_utils import get_prior_embed
@@ -31,34 +31,38 @@ def create_video_frame(gameplay_pov, prompt):
     return frame
 
 
-import openai # or your preferred LLM SDK
 import json
+import requests
 
-def get_next_step_from_llm(high_level_goal, current_inventory):
-    """Asks the LLM what STEVE-1 should do next based on the state."""
+def get_next_step_mistral(high_level_goal, current_task_status):
+    """Queries a local Mistral model via Ollama to get the next step."""
     
     system_prompt = """
     You are a Minecraft planning agent. The user wants to achieve a high-level goal.
-    Based on the current inventory, output the NEXT single action STEVE-1 should take.
+    Based on the current status, output the NEXT single action STEVE-1 should take.
     You must output valid JSON with two keys:
-    1. "steve_prompt": A short text command like "chop a tree" or "get dirt".
-    2. "target_item": The item we are trying to get in this step (e.g., "log").
-    3. "target_count": The minimum amount of that item needed to move on.
+    1. "steve_prompt": A short text command like "chop a tree", "build a tower", or "get dirt".
+    2. "rationale": A brief explanation of why this step is necessary.
     """
     
-    user_prompt = f"Goal: {high_level_goal}\nCurrent Inventory: {current_inventory}"
+    prompt = f"Goal: {high_level_goal}\nStatus: {current_task_status}"
     
-    # Example OpenAI call (replace with your actual LLM call)
-    response = openai.ChatCompletion.create(
-        model="gpt-4", 
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt}
-        ]
-    )
+    # Using local Ollama API
+    url = "http://localhost:11434/api/generate"
+    payload = {
+        "model": "mistral",
+        "prompt": f"{system_prompt}\n\n{prompt}",
+        "format": "json",
+        "stream": False
+    }
     
-    # Parse the JSON response
-    return json.loads(response.choices[0].message.content)
+    try:
+        response = requests.post(url, json=payload)
+        response_data = response.json()
+        return json.loads(response_data["response"])
+    except Exception as e:
+        print(f"Error querying Mistral: {e}")
+        return {"steve_prompt": "explore", "rationale": "Fallback due to error."}
 
 def run_interactive(in_model, in_weights, cond_scale, seed, prior_info, output_video_dirpath):
     """Runs the agent in the MineRL env and allows the user to enter prompts to control the agent.
@@ -142,50 +146,67 @@ def run_interactive(in_model, in_weights, cond_scale, seed, prior_info, output_v
         if cv2.waitKey(1) & 0xFF == ord('q'):  # Close the window when 'q' is pressed
             break
 
-def run_autonomous(agent, mineclip, prior, env, high_level_goal):
-    """Runs the agent autonomously using an LLM planner."""
-    state = {'obs': env.reset()}
+import cv2
+from collections import deque
+from tqdm import tqdm
+from steve1.utils.embed_utils import get_prior_embed
+
+def run_autonomous_mineclip(agent, mineclip, prior, env, high_level_goal, device):
+    """Runs the agent using Mistral for planning and MineCLIP for success criteria."""
+    
+    # Make sure seed is set if specified
+    obs = env.reset()[cite: 2]
+    status = "Just spawned in a new world. No items yet."
+    
+    # MineCLIP requires a 16-frame video snippet for embedding
+    frame_buffer = deque(maxlen=16)
     
     while True:
-        # 1. Get current state
-        current_inv = extract_inventory(state['obs'])
-        print(f"Current Inventory: {current_inv}")
+        # 1. Ask Mistral for the next step
+        print(f"\n[MISTRAL] Planning next step for goal: {high_level_goal}...")
+        plan = get_next_step_mistral(high_level_goal, status)
+        current_prompt = plan.get("steve_prompt", "explore")
         
-        # 2. Ask LLM for the next step
-        plan = get_next_step_from_llm(high_level_goal, current_inv)
-        current_prompt = plan["steve_prompt"]
-        target_item = plan["target_item"]
-        target_count = plan["target_count"]
+        print(f"[PLANNER] Rationale: {plan.get('rationale', '')}")
+        print(f"[PLANNER] Executing Step: '{current_prompt}'")
         
-        print(f"\n[PLANNER] Executing: '{current_prompt}' to get {target_count} {target_item}")
+        # 2. Embed the prompt using STEVE-1's prior
+        prompt_embed = get_prior_embed(current_prompt, mineclip, prior, device)
         
-        # 3. Embed the prompt (Using STEVE-1's prior)
-        prompt_embed = get_prior_embed(current_prompt, mineclip, prior, DEVICE)
-        
-        # 4. Execute the prompt until the condition is met (or timeout)
+        # 3. Execution loop for the current step
         ticks = 0
-        max_ticks = 1200 # 60 seconds at 20 FPS to prevent infinite loops
+        max_ticks = 1000 # 50 seconds at 20 FPS
+        task_completed = False
         
+        print(f"Running '{current_prompt}'...")
         with torch.cuda.amp.autocast():
             while ticks < max_ticks:
-                minerl_action = agent.get_action(state['obs'], prompt_embed)
-                state['obs'], _, done, _ = env.step(minerl_action)
+                # Get action and step env
+                minerl_action = agent.get_action(obs, prompt_embed)[cite: 2]
+                obs, _, _, _ = env.step(minerl_action)[cite: 2]
                 
-                # Check if we got the item
-                current_inv = extract_inventory(state['obs'])
-                if current_inv.get(target_item, 0) >= target_count:
-                    print(f"[PLANNER] Success! Got {target_count} {target_item}.")
-                    break # Break out to ask the LLM for the next step
+                # Process frame for video buffer
+                frame = obs['pov'][cite: 2]
+                frame_resized = cv2.resize(frame, (128, 128))[cite: 2]
+                # Convert to tensor and normalize (adapt based on specific MineCLIP pre-processing)
+                frame_tensor = torch.from_numpy(frame_resized).permute(2, 0, 1).float() / 255.0
+                frame_buffer.append(frame_tensor)
                 
-                # Render video frame (optional, adapted from your code)
-                frame = create_video_frame(state['obs']['pov'], current_prompt)
-                cv2.imshow('STEVE-1 Autonomous Planner', frame)
-                cv2.waitKey(1)
+                # Check success every 16 frames to save compute
+                if ticks % 16 == 0 and len(frame_buffer) == 16:
+                    # You will need to tune this threshold!
+                    if check_mineclip_success(mineclip, frame_buffer, current_prompt, device, threshold=0.28):
+                        print(f"[MineCLIP] Success threshold met for '{current_prompt}'!")
+                        task_completed = True
+                        break
                 
                 ticks += 1
                 
-            if ticks >= max_ticks:
-                print(f"[PLANNER] Timeout reached for '{current_prompt}'. Re-planning...")
+        # 4. Update status for the next Mistral query
+        if task_completed:
+            status = f"Successfully completed step: '{current_prompt}'."
+        else:
+            status = f"Timed out trying to complete: '{current_prompt}'. Agent might be stuck."
 
 
 if __name__ == '__main__':
@@ -202,4 +223,4 @@ if __name__ == '__main__':
     prior = load_vae_model(PRIOR_INFO)
 
     goal = input("Enter your high-level goal (e.g., 'Craft a wooden pickaxe'):\n>")
-    run_autonomous(agent, mineclip, prior, env, goal)
+    run_autonomous_mineclip(agent, mineclip, prior, env, goal)

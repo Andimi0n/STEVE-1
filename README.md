@@ -92,3 +92,6 @@ Please cite our paper if you find STEVE-1 useful for your research:
       primaryClass={cs.LG}
 }
 ```
+
+## Run the autonomous
+First ollama pull mistral then ollama serve then `. run_agent/3_run_interactive_session.sh`
