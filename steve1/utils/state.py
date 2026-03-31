@@ -9,8 +9,9 @@ def extract_inventory(obs):
 import torch
 import torch.nn.functional as F
 import numpy as np
+from mineclip.mineclip.tokenization import tokenize_batch
 
-def check_mineclip_success(mineclip_model, frame_buffer, target_prompt, device, threshold=0.25):
+def check_mineclip_success(mineclip_model, frame_buffer, target_prompt, device):
     """
     Evaluates if the 16-frame buffer matches the target prompt using MineCLIP.
     """
@@ -18,18 +19,21 @@ def check_mineclip_success(mineclip_model, frame_buffer, target_prompt, device, 
         return False
         
     # Stack frames into expected shape (Batch, Frames, Channels, Height, Width)
-    # Note: Adjust dimension ordering based on specific MineCLIP implementation expectations
     video_tensor = torch.stack(list(frame_buffer)).unsqueeze(0).to(device)
     
     with torch.no_grad():
-        # Get video embedding
-        video_embed = mineclip_model.forward_video_features(video_tensor)
+        image_feats = mineclip_model.forward_image_features(video_tensor)  # [B, L, F]
+        video_embed = mineclip_model.forward_video_features(image_feats)   # [B, F]
+
+        # --- UPDATED CODE ---
+        # Use the standalone tokenize_batch function with max_length=77 for CLIP
+        text_tokens = tokenize_batch([target_prompt], max_length=77, language_model="clip").to(device)
         
-        # Get text embedding
-        text_tokens = mineclip_model.tokenize([target_prompt]).to(device)
-        text_embed = mineclip_model.forward_text_features(text_tokens)
-        
-        # Calculate cosine similarity
+        # Use encode_text instead of forward_text_features
+        text_embed = mineclip_model.encode_text(text_tokens)
+        # --------------------
+
         similarity = F.cosine_similarity(video_embed, text_embed, dim=-1).item()
+    #print(similarity)
         
-    return similarity >= threshold
+    return similarity
